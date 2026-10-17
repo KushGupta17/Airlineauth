@@ -1,0 +1,91 @@
+const express = require('express');
+const crypto = require('crypto');
+const helmet = require('helmet');
+const cors = require('cors');
+const { PORT } = require("./config/serverConfig.js");
+const apiRoutes = require('./routes/index.js');
+const db = require('./models/index.js');
+const {User, Role} = require('./models/index.js');
+const app = express();
+
+const prepareAndStartServer = () => {
+    app.use(helmet());
+    app.use(cors());
+
+    // Distributed Tracing: Correlation ID Middleware
+    app.use((req, res, next) => {
+        const correlationId = req.headers['x-correlation-id'] || crypto.randomUUID();
+        req.correlationId = correlationId;
+        res.setHeader('x-correlation-id', correlationId);
+
+        const start = Date.now();
+        res.on('finish', () => {
+            const duration = Date.now() - start;
+            console.log(`[TRACING] [${correlationId}] ${req.method} ${req.originalUrl || req.url} - ${res.statusCode} (${duration}ms)`);
+        });
+        next();
+    });
+
+    app.use(express.json());
+    app.use(express.urlencoded({ extended: true }));
+    app.use('/api', apiRoutes);
+
+    app.get('/health', async (req, res) => {
+        try {
+            await db.sequelize.authenticate();
+            return res.status(200).json({
+                service: 'Airline_auth_service',
+                status: 'UP',
+                database: 'CONNECTED',
+                timestamp: new Date().toISOString()
+            });
+        } catch (error) {
+            return res.status(503).json({
+                service: 'Airline_auth_service',
+                status: 'DEGRADED',
+                database: 'DISCONNECTED',
+                error: error.message
+            });
+        }
+    });
+
+    app.get('/metrics', (req, res) => {
+        const memory = process.memoryUsage();
+        return res.status(200).json({
+            service: 'Airline_auth_service',
+            status: 'UP',
+            timestamp: new Date().toISOString(),
+            uptimeSeconds: Math.floor(process.uptime()),
+            memory: {
+                rssMb: +(memory.rss / (1024 * 1024)).toFixed(2),
+                heapTotalMb: +(memory.heapTotal / (1024 * 1024)).toFixed(2),
+                heapUsedMb: +(memory.heapUsed / (1024 * 1024)).toFixed(2)
+            },
+            nodeVersion: process.version
+        });
+    });
+
+    app.listen(PORT, async () => {
+        console.log(`Server is running on port ${PORT}`);
+        if (process.env.DB_SYNC === 'true') {
+            try {
+                await db.sequelize.sync({ alter: true });
+                const [adminRole] = await Role.findOrCreate({ where: { name: 'ADMIN' }, defaults: { name: 'ADMIN' } });
+                await Role.findOrCreate({ where: { name: 'CUSTOMER' }, defaults: { name: 'CUSTOMER' } });
+                const existingAdmin = await User.findOne({ where: { email: 'kushg1517@gmail.com' } });
+                if (!existingAdmin) {
+                    const newAdmin = await User.create({
+                        email: 'kushg1517@gmail.com',
+                        password: 'Admin@SkyFlow2026!'
+                    });
+                    await newAdmin.addRole(adminRole);
+                    console.log('[BOOTSTRAP] Initialized default admin account');
+                }
+            } catch (syncErr) {
+                console.error('[DB_SYNC ERROR]', syncErr.message);
+            }
+        }
+    });
+}
+
+prepareAndStartServer();
